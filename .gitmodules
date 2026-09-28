@@ -1,0 +1,9 @@
+[submodule "app/src/main/cpp/libffi"]
+	path = app/src/main/cpp/libffi
+	url = https://android.googlesource.com/platform/external/libffi
+[submodule "app/src/main/cpp/wayland"]
+	path = app/src/main/cpp/wayland
+	url = https://android.googlesource.com/platform/external/wayland
+[submodule "app/src/main/cpp/libxkbcommon"]
+	path = app/src/main/cpp/libxkbcommon
+	url = https://android.googlesource.com/platform/external/libxkbcommon
