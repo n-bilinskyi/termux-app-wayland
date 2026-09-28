@@ -157,6 +157,15 @@
             </intent-filter>
         </activity-alias>
 
+        <activity
+            android:name="com.termux.app.wayland.WaylandActivity"
+            android:exported="true"
+            android:documentLaunchMode="always"
+            android:launchMode="standard"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboard|keyboardHidden"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen" />
+
         <provider
             android:name=".filepicker.TermuxDocumentsProvider"
             android:authorities="${TERMUX_PACKAGE_NAME}.documents"
