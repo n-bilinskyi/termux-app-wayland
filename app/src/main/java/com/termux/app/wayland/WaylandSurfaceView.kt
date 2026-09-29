@@ -1,8 +1,6 @@
 package com.termux.app.wayland
 
 import android.content.Context
-import android.os.Handler
-import android.os.Looper
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.SurfaceHolder
@@ -11,19 +9,13 @@ import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
-import kotlin.math.hypot
 
 class WaylandSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Callback {
-
-    private var downTime: Long = 0
-    private var downX = 0f
-    private var downY = 0f
 
     init {
         holder.addCallback(this)
         isFocusable = true
         isFocusableInTouchMode = true
-        requestFocus()
     }
 
     override fun onCheckIsTextEditor(): Boolean = true
