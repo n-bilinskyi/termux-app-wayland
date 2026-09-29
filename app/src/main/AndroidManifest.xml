@@ -159,9 +159,10 @@
 
         <activity
             android:name="com.termux.app.wayland.WaylandActivity"
+            android:label="@string/wayland_name"
             android:exported="true"
-            android:documentLaunchMode="always"
-            android:launchMode="standard"
+            android:documentLaunchMode="intoExisting"
+            android:launchMode="singleInstance"
             android:windowSoftInputMode="adjustResize"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboard|keyboardHidden"
             android:theme="@android:style/Theme.NoTitleBar.Fullscreen" />
