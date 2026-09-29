@@ -1,14 +1,18 @@
 package com.termux.app.wayland
 
 import android.view.Surface
+import androidx.annotation.Keep
 
 object WaylandBridge {
     init {
         System.loadLibrary("wayland_bridge")
     }
 
+    @Keep
     interface ActivityListener {
+        @Keep
         fun onClientLaunched()
+        @Keep
         fun onClientExited()
     }
 

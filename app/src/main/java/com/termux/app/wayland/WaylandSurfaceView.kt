@@ -16,6 +16,7 @@ class WaylandSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder
         holder.addCallback(this)
         isFocusable = true
         isFocusableInTouchMode = true
+        requestFocus()
     }
 
     override fun onCheckIsTextEditor(): Boolean = true

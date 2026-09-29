@@ -10,3 +10,10 @@
 -dontobfuscate
 #-renamesourcefileattribute SourceFile
 #-keepattributes SourceFile,LineNumberTable
+
+-keep class com.termux.app.wayland.** { *; }
+
+-keep class * implements com.termux.app.wayland.WaylandBridge$ActivityListener {
+    public void onClientLaunched();
+    public void onClientExited();
+}
