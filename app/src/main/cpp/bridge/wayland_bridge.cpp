@@ -136,7 +136,7 @@ static KeyboardData* find_keyboard_for_client(struct wl_client* client) {
 
 static int      g_screenWidth   = 1080;
 static int      g_screenHeight  = 1920;
-static float    g_scaleFactor   = 2.0f;
+static float    g_scaleFactor   = 1.0f;
 static uint32_t g_modsDepressed = 0;
 
 static uint32_t get_current_time_ms() {
@@ -147,6 +147,55 @@ static uint32_t get_current_time_ms() {
 
 static void android_wayland_log_handler(const char *fmt, va_list argp) {
     __android_log_vprint(ANDROID_LOG_ERROR, "WaylandServer", fmt, argp);
+}
+
+// ------------------- JNI LIFECYCLE & ACTIVITY LAUNCHER -------------------
+static JavaVM*  g_jvm                     = nullptr;
+static jobject  g_bridgeListenerObject    = nullptr;
+static jmethodID g_onClientLaunchMethod   = nullptr;
+static jmethodID g_onClientExitMethod     = nullptr;
+
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
+    g_jvm = vm;
+    return JNI_VERSION_1_6;
+}
+
+static void notify_java_client_launched() {
+    if (!g_jvm || !g_bridgeListenerObject || !g_onClientLaunchMethod) return;
+
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+        g_jvm->AttachCurrentThread(&env, nullptr);
+        attached = true;
+    }
+
+    if (env) {
+        env->CallVoidMethod(g_bridgeListenerObject, g_onClientLaunchMethod);
+    }
+
+    if (attached) {
+        g_jvm->DetachCurrentThread();
+    }
+}
+
+static void notify_java_client_exited() {
+    if (!g_jvm || !g_bridgeListenerObject || !g_onClientExitMethod) return;
+
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+        g_jvm->AttachCurrentThread(&env, nullptr);
+        attached = true;
+    }
+
+    if (env) {
+        env->CallVoidMethod(g_bridgeListenerObject, g_onClientExitMethod);
+    }
+
+    if (attached) {
+        g_jvm->DetachCurrentThread();
+    }
 }
 
 // ------------------- FRAME CALLBACK HELPER -------------------
@@ -162,77 +211,211 @@ static void fire_frame_callbacks_locked(SurfaceData* sdata) {
     sdata->frame_callbacks.clear();
 }
 
-// ------------------- COMPOSITING ENGINE -------------------
-static void composite_and_post_locked() {
-    if (!g_nativeWindow) return;
+#include <EGL/egl.h>
+#include <GLES3/gl3.h>
 
-    int canvasW = (int)(g_screenWidth / g_scaleFactor);
-    int canvasH = (int)(g_screenHeight / g_scaleFactor);
-    if (canvasW <= 0 || canvasH <= 0) return;
+// ------------------- GLES HARDWARE RENDERER STATE -------------------
+static EGLDisplay g_eglDisplay = EGL_NO_DISPLAY;
+static EGLContext g_eglContext = EGL_NO_CONTEXT;
+static EGLSurface g_eglSurface = EGL_NO_SURFACE;
+static EGLConfig  g_eglConfig  = nullptr;
 
-    ANativeWindow_setBuffersGeometry(g_nativeWindow, canvasW, canvasH, WINDOW_FORMAT_RGBA_8888);
+static GLuint g_glProgram   = 0;
+static GLuint g_glTexture   = 0;
+static GLint  g_uTextureLoc = -1;
+static int    g_texWidth    = 0;
+static int    g_texHeight   = 0;
 
-    ANativeWindow_Buffer win_buf;
-    if (ANativeWindow_lock(g_nativeWindow, &win_buf, nullptr) != 0) {
-        return;
+static const char* VERTEX_SHADER_SRC =
+        "#version 300 es\n"
+        "layout(location = 0) in vec2 a_Position;\n"
+        "layout(location = 1) in vec2 a_TexCoord;\n"
+        "out vec2 v_TexCoord;\n"
+        "void main() {\n"
+        "    gl_Position = vec4(a_Position, 0.0, 1.0);\n"
+        "    v_TexCoord  = a_TexCoord;\n"
+        "}\n";
+
+static const char* FRAGMENT_SHADER_SRC =
+        "#version 300 es\n"
+        "precision mediump float;\n"
+        "in vec2 v_TexCoord;\n"
+        "uniform sampler2D u_Texture;\n"
+        "out vec4 fragColor;\n"
+        "void main() {\n"
+        "    // Sample Wayland ARGB [B, G, R, A] and hardware-swizzle to RGBA!\n"
+        "    fragColor = texture(u_Texture, v_TexCoord).bgra;\n"
+        "}\n";
+
+static GLuint compile_shader(GLenum type, const char* src) {
+    GLuint s = glCreateShader(type);
+    glShaderSource(s, 1, &src, nullptr);
+    glCompileShader(s);
+    GLint ok;
+    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        glGetShaderInfoLog(s, sizeof(log), nullptr, log);
+        LOGE("Shader compile error: %s", log);
+        glDeleteShader(s);
+        return 0;
+    }
+    return s;
+}
+
+static bool init_gles_locked() {
+    if (g_eglDisplay != EGL_NO_DISPLAY) return true;
+
+    g_eglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (g_eglDisplay == EGL_NO_DISPLAY) return false;
+
+    EGLint major, minor;
+    if (!eglInitialize(g_eglDisplay, &major, &minor)) return false;
+
+    const EGLint attribs[] = {
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+            EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+            EGL_BLUE_SIZE, 8,
+            EGL_GREEN_SIZE, 8,
+            EGL_RED_SIZE, 8,
+            EGL_ALPHA_SIZE, 8,
+            EGL_NONE
+    };
+
+    EGLint numConfigs;
+    if (!eglChooseConfig(g_eglDisplay, attribs, &g_eglConfig, 1, &numConfigs) || numConfigs <= 0) {
+        return false;
     }
 
-    uint8_t* dst_bits = (uint8_t*)win_buf.bits;
-    memset(dst_bits, 0, win_buf.height * win_buf.stride * 4);
+    const EGLint ctxAttribs[] = {
+            EGL_CONTEXT_CLIENT_VERSION, 3,
+            EGL_NONE
+    };
+    g_eglContext = eglCreateContext(g_eglDisplay, g_eglConfig, EGL_NO_CONTEXT, ctxAttribs);
+    if (g_eglContext == EGL_NO_CONTEXT) return false;
 
-    for (SurfaceData* sdata : g_activeSurfaces) {
-        if (!sdata || !sdata->current_buffer) continue;
-        if (sdata->role != ROLE_TOPLEVEL && sdata->role != ROLE_POPUP) continue;
+    return true;
+}
 
-        struct wl_shm_buffer *shm_buf = wl_shm_buffer_get(sdata->current_buffer);
-        if (!shm_buf) continue;
+static void init_gl_resources_locked() {
+    if (g_glProgram != 0) return;
 
-        int32_t src_w      = wl_shm_buffer_get_width(shm_buf);
-        int32_t src_h      = wl_shm_buffer_get_height(shm_buf);
-        int32_t src_stride = wl_shm_buffer_get_stride(shm_buf);
+    GLuint vs = compile_shader(GL_VERTEX_SHADER, VERTEX_SHADER_SRC);
+    GLuint fs = compile_shader(GL_FRAGMENT_SHADER, FRAGMENT_SHADER_SRC);
+    g_glProgram = glCreateProgram();
+    glAttachShader(g_glProgram, vs);
+    glAttachShader(g_glProgram, fs);
+    glLinkProgram(g_glProgram);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
 
-        sdata->width  = src_w;
-        sdata->height = src_h;
+    g_uTextureLoc = glGetUniformLocation(g_glProgram, "u_Texture");
 
-        int dst_x = std::max(0, sdata->x);
-        int dst_y = std::max(0, sdata->y);
+    glGenTextures(1, &g_glTexture);
+    glBindTexture(GL_TEXTURE_2D, g_glTexture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-        int copy_w = std::min(src_w, win_buf.width - dst_x);
-        int copy_h = std::min(src_h, win_buf.height - dst_y);
+    g_texWidth = 0;
+    g_texHeight = 0;
+}
 
-        if (copy_w > 0 && copy_h > 0) {
-            wl_shm_buffer_begin_access(shm_buf);
-            uint8_t* src_bits = (uint8_t*)wl_shm_buffer_get_data(shm_buf);
+// Fullscreen quad coordinates
+static const float QUAD_VERTICES[] = {
+        //  x,     y,    u,   v
+        -1.0f,  1.0f, 0.0f, 0.0f, // Top-Left
+        -1.0f, -1.0f, 0.0f, 1.0f, // Bottom-Left
+        1.0f,  1.0f, 1.0f, 0.0f, // Top-Right
+        1.0f, -1.0f, 1.0f, 1.0f  // Bottom-Right
+};
 
-            for (int y = 0; y < copy_h; y++) {
-                uint32_t* src_pixel = (uint32_t*)(src_bits + y * src_stride);
-                uint32_t* dst_pixel = (uint32_t*)(dst_bits + (dst_y + y) * win_buf.stride * 4) + dst_x;
+// ------------------- COMPOSITING ENGINE -------------------
 
-                for (int x = 0; x < copy_w; x++) {
-                    uint32_t pix = src_pixel[x];
-                    uint8_t alpha = (pix >> 24) & 0xFF;
-                    if (alpha == 255) {
-                        dst_pixel[x] = pix;
-                    } else if (alpha > 0) {
-                        uint32_t bg = dst_pixel[x];
-                        uint32_t rb = (pix & 0xFF00FF) + (((bg & 0xFF00FF) * (255 - alpha)) >> 8);
-                        uint32_t g  = (pix & 0x00FF00) + (((bg & 0x00FF00) * (255 - alpha)) >> 8);
-                        dst_pixel[x] = (rb & 0xFF00FF) | (g & 0x00FF00) | 0xFF000000;
-                    }
-                }
-            }
-            wl_shm_buffer_end_access(shm_buf);
+static void composite_and_post_locked() {
+    if (!g_nativeWindow || g_eglDisplay == EGL_NO_DISPLAY) return;
+
+    // Create EGL window surface if not already created
+    if (g_eglSurface == EGL_NO_SURFACE) {
+        g_eglSurface = eglCreateWindowSurface(g_eglDisplay, g_eglConfig, g_nativeWindow, nullptr);
+        if (g_eglSurface == EGL_NO_SURFACE) return;
+        eglMakeCurrent(g_eglDisplay, g_eglSurface, g_eglSurface, g_eglContext);
+        init_gl_resources_locked();
+    }
+
+    // Find active toplevel buffer
+    SurfaceData* toplevel = nullptr;
+    for (auto it = g_activeSurfaces.rbegin(); it != g_activeSurfaces.rend(); ++it) {
+        SurfaceData* s = *it;
+        if (s && s->role == ROLE_TOPLEVEL && s->current_buffer) {
+            toplevel = s;
+            break;
         }
     }
 
-    ANativeWindow_unlockAndPost(g_nativeWindow);
+    // If there are no surfaces, clear display to black
+    if (!toplevel || !toplevel->current_buffer) {
+        if (g_eglDisplay != EGL_NO_DISPLAY && g_eglSurface != EGL_NO_SURFACE) {
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            eglSwapBuffers(g_eglDisplay, g_eglSurface);
+        }
+        return;
+    }
+
+    struct wl_shm_buffer *shm_buf = wl_shm_buffer_get(toplevel->current_buffer);
+    if (!shm_buf) return;
+
+    int32_t width  = wl_shm_buffer_get_width(shm_buf);
+    int32_t height = wl_shm_buffer_get_height(shm_buf);
+    int32_t stride = wl_shm_buffer_get_stride(shm_buf);
+    if (width <= 0 || height <= 0) return;
+
+    glViewport(0, 0, g_screenWidth, g_screenHeight);
+
+    wl_shm_buffer_begin_access(shm_buf);
+    void* pixels = wl_shm_buffer_get_data(shm_buf);
+
+    glBindTexture(GL_TEXTURE_2D, g_glTexture);
+
+    // GLES 3 allows arbitrary row stride without CPU pitch padding
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, stride / 4);
+
+    if (g_texWidth != width || g_texHeight != height) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+        g_texWidth = width;
+        g_texHeight = height;
+    } else {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    }
+
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    wl_shm_buffer_end_access(shm_buf);
+
+    // Draw textured quad
+    glUseProgram(g_glProgram);
+    glUniform1i(g_uTextureLoc, 0);
+
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), QUAD_VERTICES);
+    glEnableVertexAttribArray(0);
+
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), &QUAD_VERTICES[2]);
+    glEnableVertexAttribArray(1);
+
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    // Post frame to Android SurfaceFlinger hardware composer
+    eglSwapBuffers(g_eglDisplay, g_eglSurface);
 }
+
 
 // ------------------- SURFACE LIFECYCLE -------------------
 
 static void on_surface_destroyed(struct wl_resource *resource) {
     pthread_mutex_lock(&g_waylandMutex);
 
+    // 1. Clear focus pointers referencing this surface
     for (KeyboardData* kd : g_keyboards) {
         if (kd->focused_surface == resource) kd->focused_surface = nullptr;
     }
@@ -242,7 +425,6 @@ static void on_surface_destroyed(struct wl_resource *resource) {
             pd->button_pressed = false;
         }
     }
-
     for (TouchData* td : g_touches) {
         if (td->surface == resource) {
             td->surface = nullptr;
@@ -252,6 +434,19 @@ static void on_surface_destroyed(struct wl_resource *resource) {
 
     SurfaceData* sdata = (SurfaceData*) wl_resource_get_user_data(resource);
     if (sdata) {
+        // 2. Disconnect child resources to prevent use-after-free
+        if (sdata->role_resource) {
+            wl_resource_set_user_data(sdata->role_resource, nullptr);
+            wl_resource_set_destructor(sdata->role_resource, nullptr);
+            sdata->role_resource = nullptr;
+        }
+        if (sdata->xdg_surface) {
+            wl_resource_set_user_data(sdata->xdg_surface, nullptr);
+            wl_resource_set_destructor(sdata->xdg_surface, nullptr);
+            sdata->xdg_surface = nullptr;
+        }
+
+        // 3. Unlink buffer destroy listener safely
         if (sdata->listening_to_buffer) {
             wl_list_remove(&sdata->current_buffer_destroy_listener.link);
             sdata->listening_to_buffer = false;
@@ -259,12 +454,15 @@ static void on_surface_destroyed(struct wl_resource *resource) {
         sdata->current_buffer = nullptr;
         sdata->pending_buffer = nullptr;
 
+        // 4. Do NOT call wl_resource_destroy() here! Just unhook callbacks;
+        // libwayland destroys client resources automatically on exit.
         for (struct wl_resource* cb : sdata->frame_callbacks) {
+            wl_resource_set_user_data(cb, nullptr);
             wl_resource_set_destructor(cb, nullptr);
-            wl_resource_destroy(cb);
         }
         sdata->frame_callbacks.clear();
 
+        // 5. Remove from active surfaces
         auto it = std::find(g_activeSurfaces.begin(), g_activeSurfaces.end(), sdata);
         if (it != g_activeSurfaces.end()) {
             g_activeSurfaces.erase(it);
@@ -272,8 +470,13 @@ static void on_surface_destroyed(struct wl_resource *resource) {
         delete sdata;
     }
 
+    if (g_activeSurfaces.empty()) {
+        notify_java_client_exited();
+    }
+
     pthread_mutex_unlock(&g_waylandMutex);
 }
+
 static void surface_attach(struct wl_client*, struct wl_resource *resource, struct wl_resource *buffer, int32_t, int32_t) {
     SurfaceData* sdata = (SurfaceData*) wl_resource_get_user_data(resource);
     if (!sdata) return;
@@ -471,6 +674,8 @@ static void xdg_surface_get_toplevel(struct wl_client* client, struct wl_resourc
     if (sdata) {
         send_keyboard_focus_to(sdata->surface_resource);
     }
+
+    notify_java_client_launched();
 }
 
 struct PositionerData {
@@ -516,17 +721,11 @@ static const struct xdg_popup_interface popup_implementation = {
 
 static void on_popup_destroyed(struct wl_resource *resource) {
     pthread_mutex_lock(&g_waylandMutex);
-
     SurfaceData* sdata = (SurfaceData*) wl_resource_get_user_data(resource);
     if (sdata) {
         sdata->role_resource = nullptr;
         sdata->role = ROLE_NONE;
     }
-
-    pthread_mutex_lock(&g_windowMutex);
-    composite_and_post_locked();
-    pthread_mutex_unlock(&g_windowMutex);
-
     pthread_mutex_unlock(&g_waylandMutex);
 }
 
@@ -875,7 +1074,7 @@ static void* wayland_thread(void*) {
 // ------------------- JNI EXPORTS -------------------
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_termux_app_wayland_WaylandBridge_initServer(JNIEnv* env, jobject, jstring jRuntimeDir) {
+Java_com_termux_app_wayland_WaylandBridge_initServer(JNIEnv* env, jclass , jstring jRuntimeDir) {
     if (g_display) return;
 
     pthread_mutexattr_t attr;
@@ -933,13 +1132,23 @@ Java_com_termux_app_wayland_WaylandBridge_initServer(JNIEnv* env, jobject, jstri
 extern "C" JNIEXPORT void JNICALL
 Java_com_termux_app_wayland_WaylandBridge_setSurface(JNIEnv* env, jobject, jobject surface) {
     pthread_mutex_lock(&g_windowMutex);
+
+    if (g_eglDisplay != EGL_NO_DISPLAY && g_eglSurface != EGL_NO_SURFACE) {
+        eglMakeCurrent(g_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        eglDestroySurface(g_eglDisplay, g_eglSurface);
+        g_eglSurface = EGL_NO_SURFACE;
+    }
+
     if (g_nativeWindow) {
         ANativeWindow_release(g_nativeWindow);
         g_nativeWindow = nullptr;
     }
+
     if (surface) {
         g_nativeWindow = ANativeWindow_fromSurface(env, surface);
+        init_gles_locked();
     }
+
     pthread_mutex_unlock(&g_windowMutex);
 }
 
@@ -1168,4 +1377,19 @@ Java_com_termux_app_wayland_WaylandBridge_refresh(JNIEnv*, jobject) {
     pthread_mutex_lock(&g_windowMutex);
     composite_and_post_locked();
     pthread_mutex_unlock(&g_windowMutex);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_termux_app_wayland_WaylandBridge_registerActivityListener(JNIEnv* env, jclass , jobject listener) {
+    if (g_bridgeListenerObject) {
+        env->DeleteGlobalRef(g_bridgeListenerObject);
+        g_bridgeListenerObject = nullptr;
+    }
+
+    if (listener) {
+        g_bridgeListenerObject = env->NewGlobalRef(listener);
+        jclass clazz = env->GetObjectClass(listener);
+        g_onClientLaunchMethod = env->GetMethodID(clazz, "onClientLaunched", "()V");
+        g_onClientExitMethod   = env->GetMethodID(clazz, "onClientExited", "()V");
+    }
 }

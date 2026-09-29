@@ -217,6 +217,8 @@ target_link_libraries(wayland_bridge
         wayland_server
         android
         log
+        EGL
+        GLESv3
 )
 
 # ==============================================================================

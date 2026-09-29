@@ -1,31 +1,55 @@
 package com.termux.app.wayland
 
 import android.app.Activity
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
 import android.os.Bundle
 import android.view.ViewGroup
 import android.widget.FrameLayout
-import java.io.File
+
 
 class WaylandActivity : Activity() {
 
     private lateinit var surfaceView: WaylandSurfaceView
 
-        override fun onCreate(savedInstanceState: Bundle?) {
-            super.onCreate(savedInstanceState)
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
 
-            // 1. Socket lives inside Termux's standard /tmp directory!
-            val runtimeDir = File("/data/data/com.termux/files/usr/tmp").apply {
-                if (!exists()) mkdirs()
-            }
+        surfaceView = WaylandSurfaceView(this)
+        setContentView(surfaceView, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        ))
+    }
 
-            // 2. Start the native Wayland server
-            WaylandBridge.initServer(runtimeDir.absolutePath)
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        surfaceView.toggleKeyboard()
+    }
 
-            // 3. Fullscreen SurfaceView
-            surfaceView = WaylandSurfaceView(this)
-            setContentView(surfaceView, FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            ))
+    private val exitReceiver: BroadcastReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            finish()
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        val filter = IntentFilter("com.termux.app.wayland.ACTION_EXIT")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(exitReceiver, filter, RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(exitReceiver, filter)
+        }
+
+    }
+
+    override fun onPause() {
+        super.onPause()
+        unregisterReceiver(exitReceiver)
+    }
+
 }

@@ -22,6 +22,8 @@ import com.termux.R;
 import com.termux.app.event.SystemEventReceiver;
 import com.termux.app.terminal.TermuxTerminalSessionActivityClient;
 import com.termux.app.terminal.TermuxTerminalSessionServiceClient;
+import com.termux.app.wayland.WaylandActivity;
+import com.termux.app.wayland.WaylandBridge;
 import com.termux.shared.termux.plugins.TermuxPluginUtils;
 import com.termux.shared.data.IntentUtils;
 import com.termux.shared.net.uri.UriUtils;
@@ -120,6 +122,24 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
         runStartForeground();
 
         SystemEventReceiver.registerPackageUpdateEvents(this);
+
+        WaylandBridge.initServer(TermuxConstants.TERMUX_TMP_PREFIX_DIR_PATH);
+
+        WaylandBridge.registerActivityListener(new WaylandBridge.ActivityListener() {
+            @Override
+            public void onClientLaunched() {
+                Intent intent = new Intent(TermuxService.this, WaylandActivity.class);
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                startActivity(intent);
+            }
+
+            @Override
+            public void onClientExited() {
+                Intent intent = new Intent("com.termux.app.wayland.ACTION_EXIT");
+                sendBroadcast(intent);
+            }
+        });
+
     }
 
     @SuppressLint("Wakelock")
