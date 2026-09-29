@@ -67,6 +67,13 @@ struct SurfaceData {
     int height = 0;
     bool has_parent = false;
 
+    // Damage tracking
+    bool has_damage = false;
+    int32_t dmg_x = 0;
+    int32_t dmg_y = 0;
+    int32_t dmg_w = 0;
+    int32_t dmg_h = 0;
+
     // Buffer destroy listener to prevent dangling pointers
     struct wl_listener current_buffer_destroy_listener;
     bool listening_to_buffer = false;
@@ -379,18 +386,29 @@ static void composite_and_post_locked() {
 
     glBindTexture(GL_TEXTURE_2D, g_glTexture);
 
-    // GLES 3 allows arbitrary row stride without CPU pitch padding
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, stride / 4);
-
-    if (g_texWidth != width || g_texHeight != height) {
+    if (g_texWidth != width || g_texHeight != height || !toplevel->has_damage) {
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, stride / 4);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+
         g_texWidth = width;
         g_texHeight = height;
     } else {
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+        int x = std::max(0, toplevel->dmg_x);
+        int y = std::max(0, toplevel->dmg_y);
+        int w = std::min(toplevel->dmg_w, width - x);
+        int h = std::min(toplevel->dmg_h, height - y);
+
+        if (w > 0 && h > 0) {
+            uint8_t* sub_pixels = (uint8_t*)pixels + (y * stride) + (x * 4);
+            glPixelStorei(GL_UNPACK_ROW_LENGTH, stride / 4);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, sub_pixels);
+            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+        }
     }
 
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    toplevel->has_damage = false;
+
     wl_shm_buffer_end_access(shm_buf);
 
     // Draw textured quad
@@ -547,10 +565,36 @@ static void on_frame_callback_destroyed(struct wl_resource *resource) {
     }
 }
 
+static void surface_add_damage(SurfaceData* sdata, int32_t x, int32_t y, int32_t w, int32_t h) {
+    if (!sdata || w <= 0 || h <= 0) return;
+
+    if (!sdata->has_damage) {
+        sdata->dmg_x = x;
+        sdata->dmg_y = y;
+        sdata->dmg_w = w;
+        sdata->dmg_h = h;
+        sdata->has_damage = true;
+    } else {
+        // Union the bounding box
+        int32_t x1 = std::min(sdata->dmg_x, x);
+        int32_t y1 = std::min(sdata->dmg_y, y);
+        int32_t x2 = std::max(sdata->dmg_x + sdata->dmg_w, x + w);
+        int32_t y2 = std::max(sdata->dmg_y + sdata->dmg_h, y + h);
+
+        sdata->dmg_x = x1;
+        sdata->dmg_y = y1;
+        sdata->dmg_w = x2 - x1;
+        sdata->dmg_h = y2 - y1;
+    }
+}
+
 static const struct wl_surface_interface surface_interface = {
         .destroy              = [](struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); },
         .attach               = surface_attach,
-        .damage               = [](struct wl_client*, struct wl_resource*, int32_t, int32_t, int32_t, int32_t) {},
+        .damage               = [](struct wl_client*, struct wl_resource* r, int32_t x, int32_t y, int32_t w, int32_t h) {
+            SurfaceData* s = (SurfaceData*) wl_resource_get_user_data(r);
+            surface_add_damage(s, x, y, w, h);
+        },
         .frame = [](struct wl_client* c, struct wl_resource* resource, uint32_t id) {
             SurfaceData* sdata = (SurfaceData*) wl_resource_get_user_data(resource);
             struct wl_resource* cb = wl_resource_create(c, &wl_callback_interface, 1, id);
@@ -569,7 +613,10 @@ static const struct wl_surface_interface surface_interface = {
         .commit               = surface_commit,
         .set_buffer_transform = [](struct wl_client*, struct wl_resource*, int32_t) {},
         .set_buffer_scale     = [](struct wl_client*, struct wl_resource*, int32_t) {},
-        .damage_buffer        = [](struct wl_client*, struct wl_resource*, int32_t, int32_t, int32_t, int32_t) {},
+        .damage_buffer        = [](struct wl_client*, struct wl_resource* r, int32_t x, int32_t y, int32_t w, int32_t h) {
+            SurfaceData* s = (SurfaceData*) wl_resource_get_user_data(r);
+            surface_add_damage(s, x, y, w, h);
+        },
 };
 
 static void compositor_create_surface(struct wl_client *client, struct wl_resource *resource, uint32_t id) {
@@ -1388,8 +1435,18 @@ Java_com_termux_app_wayland_WaylandBridge_registerActivityListener(JNIEnv* env, 
 
     if (listener) {
         g_bridgeListenerObject = env->NewGlobalRef(listener);
-        jclass clazz = env->GetObjectClass(listener);
-        g_onClientLaunchMethod = env->GetMethodID(clazz, "onClientLaunched", "()V");
-        g_onClientExitMethod   = env->GetMethodID(clazz, "onClientExited", "()V");
+
+        jclass ifaceClass = env->FindClass("com/termux/app/wayland/WaylandBridge$ActivityListener");
+        if (ifaceClass) {
+            g_onClientLaunchMethod = env->GetMethodID(ifaceClass, "onClientLaunched", "()V");
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+            }
+
+            g_onClientExitMethod = env->GetMethodID(ifaceClass, "onClientExited", "()V");
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+            }
+        }
     }
 }
