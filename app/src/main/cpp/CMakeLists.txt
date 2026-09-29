@@ -1,6 +1,5 @@
 cmake_minimum_required(VERSION 3.22.1)
 
-# Enable C, C++, and Assembly (ASM is REQUIRED for libffi .S files!)
 project("wayland_desktop" C CXX ASM)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -82,6 +81,10 @@ add_library(ffi STATIC ${LIBFFI_SRCS})
 target_include_directories(ffi PUBLIC
         ${LIBFFI_DIR}/include
         ${LIBFFI_ARCH_INC}
+)
+
+target_compile_definitions(ffi PRIVATE
+    HAVE_AS_X86_PCREL
 )
 
 target_compile_options(ffi PRIVATE
